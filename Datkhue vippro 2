@@ -1,0 +1,37 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
+from datkhue_engine_pro import fetch_klines, enrich, score_and_predict, walkforward_backtest
+import uvicorn
+
+app = FastAPI(title="Dật Khuê PRO Backend")
+
+class PredictRequest(BaseModel):
+    symbol: str = "BTCUSDT"
+    interval: str = "5m"
+    limit: int = 1000
+
+class BacktestRequest(BaseModel):
+    symbol: str = "BTCUSDT"
+    limit: int = 1000
+    test_n: int = 200
+
+@app.get("/api/health")
+def health():
+    return {"status":"ok","service":"datkhue_pro"}
+
+@app.post("/api/predict")
+def predict(req: PredictRequest):
+    df = fetch_klines(symbol=req.symbol, interval=req.interval, limit=req.limit)
+    df = enrich(df)
+    pred = score_and_predict(df)
+    return {"prediction": pred, "symbol": req.symbol}
+
+@app.post("/api/backtest")
+def backtest(req: BacktestRequest):
+    df = fetch_klines(symbol=req.symbol, interval="5m", limit=req.limit)
+    df = enrich(df)
+    res = walkforward_backtest(df, lookback_window=300, n_predict=req.test_n, save_csv="dtk_predictions_pro.csv")
+    return res
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
