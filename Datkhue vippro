@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""datkhue_engine_pro.py
+Optimized heuristic engine for Dật Khuê (version: PRO)
+"""
+import requests, math, csv, copy
+import pandas as pd, numpy as np
+from datetime import datetime
+
+PARAMS = {
+    "interval": "5m",
+    "limit": 2000,
+    "weights": {
+        "engulfing": 12,
+        "pinbar": 9,
+        "inside": 3,
+        "momentum": 14,
+        "fvg": 24,
+        "order_block": 28,
+        "liquidity_sweep": 20,
+        "bos": 14,
+        "kill_zone": 6,
+        "atr_filter": 8,
+        "trend_filter": 10,
+        "rsi_filter": 8,
+        "volume_confirm": 8
+    },
+    "predict_threshold_ratio": 0.75,
+    "strong_margin": 14,
+    "lookback_smc": 50,
+    "min_volume_multiplier_for_momentum": 1.3,
+    "rsi_period": 14,
+    "ema_short": 9,
+    "ema_long": 48,
+    "sideways_std_threshold": 0.0008
+}
+
+def fetch_klines(symbol='BTCUSDT', interval='5m', limit=500):
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    df = pd.DataFrame(data, columns=[
+        "open_time","open","high","low","close","volume",
+        "close_time","quote_asset_volume","num_trades",
+        "taker_base_vol","taker_quote_vol","ignore"
+    ])
+    for c in ["open","high","low","close","volume","taker_base_vol"]:
+        df[c] = df[c].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df = df.reset_index(drop=True)
+    return df
+
+def enrich(df):
+    df = df.copy()
+    df["body"] = (df["close"] - df["open"]).abs()
+    df["range"] = (df["high"] - df["low"]).replace(0, np.nan)
+    df["body_pct"] = df["body"] / df["range"]
+    df["upper_wick"] = df["high"] - df[["open","close"]].max(axis=1)
+    df["lower_wick"] = df[["open","close"]].min(axis=1) - df["low"]
+    prev_close = df["close"].shift(1)
+    tr = np.maximum(df["high"] - df["low"], np.maximum((df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()))
+    df["tr"] = tr
+    df["atr14"] = df["tr"].rolling(14, min_periods=1).mean()
+    df["avg_volume20"] = df["volume"].rolling(20, min_periods=1).mean()
+    df["avg_bodypct20"] = df["body_pct"].rolling(20, min_periods=1).mean().fillna(0.001)
+    # EMA & trend
+    df["ema_short"] = df["close"].ewm(span=PARAMS["ema_short"], adjust=False).mean()
+    df["ema_long"] = df["close"].ewm(span=PARAMS["ema_long"], adjust=False).mean()
+    df["ema_slope"] = df["ema_short"] - df["ema_long"]
+    # RSI
+    delta = df["close"].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/PARAMS["rsi_period"], adjust=False).mean()
+    ma_down = down.ewm(alpha=1/PARAMS["rsi_period"], adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["volume_delta"] = df["taker_base_vol"] - (df["volume"] - df["taker_base_vol"])
+    df["close_pct_change"] = df["close"].pct_change().fillna(0)
+    df["rolling_price_std"] = df["close_pct_change"].rolling(40, min_periods=1).std().fillna(0)
+    return df
+
+def is_engulfing(prev, curr):
+    prev_high = max(prev["open"], prev["close"])
+    prev_low = min(prev["open"], prev["close"])
+    curr_high = max(curr["open"], curr["close"])
+    curr_low = min(curr["open"], curr["close"])
+    return (curr_high > prev_high and curr_low < prev_low) and (curr["body"] > prev["body"] * 0.85)
+
+def is_pinbar(c):
+    body = c["body"]
+    up = c["upper_wick"]
+    low = c["lower_wick"]
+    return (up > body * 2.5 and low < body * 0.6) or (low > body * 2.5 and up < body * 0.6)
+
+def is_inside(prev, curr):
+    return (curr["high"] < prev["high"]) and (curr["low"] > prev["low"])
+
+def is_momentum(c):
+    if math.isnan(c.get("body_pct", 0)):
+        return False
+    cond1 = c["body_pct"] > (c.get("avg_bodypct20", 0.001) * 1.7)
+    cond2 = c["volume"] > (c.get("avg_volume20", 0.0) * PARAMS["min_volume_multiplier_for_momentum"])
+    return cond1 and cond2
+
+def detect_bos(df, idx, lookback=20):
+    if idx < 1: return None
+    lb = min(lookback, idx)
+    prior_max = df["high"].iloc[idx - lb:idx].max()
+    prior_min = df["low"].iloc[idx - lb:idx].min()
+    curr_high = df["high"].iloc[idx]
+    curr_low = df["low"].iloc[idx]
+    if curr_high > prior_max + 1e-9: return "up"
+    if curr_low < prior_min - 1e-9: return "down"
+    return None
+
+def detect_liquidity_sweep(df, idx, lookback=40):
+    if idx + 1 >= len(df) or idx < 1: return False
+    lb = min(lookback, idx)
+    prior_max = df["high"].iloc[idx - lb:idx].max()
+    prior_min = df["low"].iloc[idx - lb:idx].min()
+    h = df["high"].iloc[idx]
+    l = df["low"].iloc[idx]
+    if h > prior_max and df["close"].iloc[idx + 1] < prior_max: return "upper"
+    if l < prior_min and df["close"].iloc[idx + 1] > prior_min: return "lower"
+    return False
+
+def detect_fvg(df, idx):
+    if idx < 2: return None
+    b = df.iloc[idx - 1]
+    c = df.iloc[idx]
+    if b["high"] < c["low"]: return "bullish"
+    if b["low"] > c["high"]: return "bearish"
+    return None
+
+def detect_order_block(df, idx, lookback=40):
+    if idx < 2: return None
+    lb = min(lookback, idx)
+    window = df.iloc[idx-lb:idx]
+    cand_i = window["body"].idxmax()
+    cand = df.loc[cand_i]
+    if cand_i+1 <= idx:
+        subsequent_close = df["close"].iloc[cand_i+1: idx+1].mean()
+    else:
+        return None
+    if cand["close"] < cand["open"] and subsequent_close > cand["close"] + (cand["body"]*0.3):
+        return {"at_index": int(cand_i), "type": "bearish"}
+    if cand["close"] > cand["open"] and subsequent_close < cand["close"] - (cand["body"]*0.3):
+        return {"at_index": int(cand_i), "type": "bullish"}
+    return None
+
+def in_kill_zone(ts):
+    h = ts.tz_localize(None).hour
+    if 7 <= h <= 9: return "london"
+    if 13 <= h <= 15: return "newyork"
+    return None
+
+def is_sideways(df):
+    return df["rolling_price_std"].iloc[-1] < PARAMS["sideways_std_threshold"]
+
+def score_and_predict(df):
+    if len(df) < 10:
+        return {"direction":"skip","reason":"not enough data","confidence":0.0}
+    idx = len(df)-1
+    last = df.iloc[idx]
+    prev = df.iloc[idx-1]
+    w = PARAMS["weights"]
+    max_possible = sum(w.values())
+    score_up = 0.0; score_down = 0.0; reasons = []
+    if is_sideways(df):
+        return {"direction":"skip","reason":"sideways detected", "confidence":0.0}
+    if is_engulfing(prev, last):
+        if last["close"] > last["open"]:
+            score_up += w["engulfing"]; reasons.append("engulf_up")
+        else:
+            score_down += w["engulfing"]; reasons.append("engulf_down")
+    if is_pinbar(last):
+        if last["close"] > last["open"]:
+            score_up += w["pinbar"]; reasons.append("pinbar_up")
+        else:
+            score_down += w["pinbar"]; reasons.append("pinbar_down")
+    if is_inside(prev, last):
+        if last["close"] > last["open"]:
+            score_up += w["inside"]; reasons.append("inside_up")
+        else:
+            score_down += w["inside"]; reasons.append("inside_down")
+    if is_momentum(last):
+        if last["close"] > last["open"]:
+            score_up += w["momentum"]; reasons.append("momentum_up")
+        else:
+            score_down += w["momentum"]; reasons.append("momentum_down")
+    bos = detect_bos(df, idx, PARAMS["lookback_smc"])
+    if bos=="up": score_up += w["bos"]; reasons.append("bos_up")
+    if bos=="down": score_down += w["bos"]; reasons.append("bos_down")
+    sweep = detect_liquidity_sweep(df, idx, PARAMS["lookback_smc"])
+    if sweep=="upper": score_down += w["liquidity_sweep"]; reasons.append("sweep_upper")
+    if sweep=="lower": score_up += w["liquidity_sweep"]; reasons.append("sweep_lower")
+    fvg = detect_fvg(df, idx)
+    if fvg=="bullish": score_up += w["fvg"]; reasons.append("fvg_bull")
+    if fvg=="bearish": score_down += w["fvg"]; reasons.append("fvg_bear")
+    ob = detect_order_block(df, idx, PARAMS["lookback_smc"])
+    if ob:
+        if ob["type"]=="bearish": score_down += w["order_block"]; reasons.append("ob_bear")
+        else: score_up += w["order_block"]; reasons.append("ob_bull")
+    if last["ema_slope"] > 0:
+        score_up += w["trend_filter"]; reasons.append("ema_trend_up")
+    elif last["ema_slope"] < 0:
+        score_down += w["trend_filter"]; reasons.append("ema_trend_down")
+    if last["rsi"] > 85 or last["rsi"] < 15:
+        return {"direction":"skip", "reason":"rsi_extreme", "confidence":0.0}
+    if abs(last["volume_delta"]) > (last["avg_volume20"] * 0.9):
+        if last["volume_delta"] > 0 and last["close"] > last["open"]:
+            score_up += w["volume_confirm"]; reasons.append("vol_conf_buy")
+        elif last["volume_delta"] < 0 and last["close"] < last["open"]:
+            score_down += w["volume_confirm"]; reasons.append("vol_conf_sell")
+    if last["atr14"] > 0 and last["body"] < 0.12 * last["atr14"]:
+        score_up -= w["atr_filter"]; score_down -= w["atr_filter"]; reasons.append("atr_tiny")
+    score_up = max(0, score_up); score_down = max(0, score_down)
+    max_score = max(score_up, score_down)
+    threshold = PARAMS["predict_threshold_ratio"] * sum(PARAMS["weights"].values())
+    if max_score < threshold:
+        return {"direction":"skip", "reason":f"score {max_score:.1f} < threshold {threshold:.1f}", "score_up":score_up, "score_down":score_down, "reasons":reasons}
+    direction = "up" if score_up > score_down else "down"
+    diff = abs(score_up - score_down)
+    strength = "strong" if (diff >= PARAMS["strong_margin"] or max_score > 0.85*sum(PARAMS["weights"].values())) else "weak"
+    confidence = min(99.9, 40 + (max_score / sum(PARAMS["weights"].values()))*50 + (diff / sum(PARAMS["weights"].values()))*10)
+    return {"direction":direction, "strength":strength, "confidence":round(confidence,2), "score_up":score_up, "score_down":score_down, "reasons":reasons}
+
+def walkforward_backtest(df, lookback_window=200, n_predict=200, save_csv="dtk_predictions_pro.csv"):
+    df = df.copy().reset_index(drop=True)
+    results = []
+    start_idx = max(lookback_window, 50)
+    begin = len(df) - n_predict - 1
+    if begin < start_idx:
+        begin = start_idx
+    for i in range(begin, len(df)-1):
+        sub = df.iloc[:i+1].copy().reset_index(drop=True)
+        sub = enrich(sub)
+        pred = score_and_predict(sub)
+        next_candle = df.iloc[i+1]
+        actual = "up" if next_candle["close"] > next_candle["open"] else "down"
+        correct = None
+        if pred.get("direction") and pred["direction"]!="skip":
+            correct = (pred["direction"]==actual)
+        row = {
+            "index_as_of": i,
+            "time": sub["open_time"].iloc[-1].isoformat(),
+            "pred": pred.get("direction"),
+            "strength": pred.get("strength"),
+            "confidence": pred.get("confidence"),
+            "score_up": pred.get("score_up"),
+            "score_down": pred.get("score_down"),
+            "actual_next": actual,
+            "correct": correct,
+            "reasons": "|".join(pred.get("reasons",[])),
+            "note": pred.get("reason","")
+        }
+        results.append(row)
+    if results:
+        keys = results[0].keys()
+        with open(save_csv, "w", newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=list(keys))
+            writer.writeheader()
+            writer.writerows(results)
+    executed = [r for r in results if r["pred"] and r["pred"]!="skip"]
+    total = len(executed)
+    wins = sum(1 for r in executed if r["correct"] is True)
+    skips = len(results) - total
+    winrate = (wins/total*100) if total>0 else 0.0
+    return {"total_predictions": total, "wins": wins, "skips": skips, "winrate": winrate, "logfile": save_csv, "detail_rows": results}
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", default="BTCUSDT")
+    parser.add_argument("--limit", type=int, default=1000)
+    parser.add_argument("--test", type=int, default=200)
+    args = parser.parse_args()
+    df = fetch_klines(symbol=args.symbol, interval=PARAMS["interval"], limit=args.limit)
+    df = enrich(df)
+    print("Running pro backtest...")
+    res = walkforward_backtest(df, lookback_window=300, n_predict=args.test, save_csv="dtk_predictions_pro.csv")
+    print(res)
