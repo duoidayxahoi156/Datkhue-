@@ -1,0 +1,50 @@
+name: Build Dật Khuê APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      
+MANIFEST_URL: "https://duoidayxahoi156.github.io/Datkhue-/manifest.json"
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Install frontend deps & build web app
+      run: |
+        cd frontend
+        npm install --silent
+        npm run build
+
+    - name: Install Bubblewrap
+      run: npm install -g @bubblewrap/cli
+
+    - name: Init TWA project (non-interactive)
+      run: |
+        npx bubblewrap init --manifest=${{ env.MANIFEST_URL }} --skipPwaValidation || true
+
+    - name: Build APK (assembleRelease)
+      working-directory: twa-manifest
+      run: ./gradlew assembleRelease --no-daemon
+
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: datkhue-apk
+        path: twa-manifest/app/build/outputs/apk/release/*.apk
